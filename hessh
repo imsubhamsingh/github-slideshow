@@ -1,0 +1,686 @@
+#!/usr/bin/python
+
+import json
+import re
+import sys
+import tempfile
+import os
+import subprocess
+from os.path import expanduser
+from functools import wraps
+
+import click
+import requests as req
+from terminaltables import AsciiTable
+
+
+BRAHMA_SERVER = 'http://brahma.hackerearth.com/'
+API_URL = BRAHMA_SERVER + 'api/'
+CONFIG_DIR = expanduser('~') + '/.hessh'
+CONFIG_FILE = CONFIG_DIR + '/config'
+PRIVATE_KEYFILE = CONFIG_DIR + '/he-user'
+PUBLIC_KEYFILE = PRIVATE_KEYFILE + '.pub'
+__version__ = '0.8'
+
+hessh = click.Group()
+data = {}
+
+
+class BaseConstants(object):
+    SCP_JUMPHOST_UPLOAD = 'scp -i {user_key} -o "ProxyCommand ssh -W %h:%p -i {user_key} {jumphost} -o StrictHostKeyChecking=no" {lfp} {user}@{remote_machine}:{rfp}'
+    SCP_JUMPHOST_DOWNLOAD = 'scp -i {user_key} -o "ProxyCommand ssh -W %h:%p -i {user_key} {jumphost} -o StrictHostKeyChecking=no" {user}@{remote_machine}:{rfp} {lfp}'
+
+    SCP_NORMAL_UPLOAD = 'scp -i {user_key} {lfp} {user}@{remote_machine}:{rfp}'
+    SCP_NORMAL_DOWNLOAD = 'scp -i {user_key} {user}@{remote_machine}:{rfp} {lfp}'
+
+    @staticmethod
+    def get_scp_format(use_jumphost=True, action='download'):
+        if use_jumphost:
+            method = 'jumphost'
+        else:
+            method = 'normal'
+        if action == 'download':
+            process = 'download'
+        else:
+            process = 'upload'
+
+        format_attr_name = 'SCP_{method}_{process}'.format(method=method,
+                                                           process=process).upper()
+        return getattr(BaseConstants, format_attr_name)
+
+
+def validate_email(ctx, param, value):
+    email_pattern = re.compile(r'\w+@hackerearth.com$')
+    if email_pattern.search(value) is None:
+        raise click.BadParameter('Please use your hackerearth email.')
+    else:
+        return value.strip()
+
+
+def check_config_existance(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        no_token = False
+        if (not os.path.exists(CONFIG_DIR) or
+            not os.path.exists(CONFIG_FILE)):
+            no_token = True
+        else:
+            with open(CONFIG_FILE) as fp:
+                try:
+                    global data
+                    data = json.loads(fp.read())
+                    data['version'] = __version__
+                except:
+                    no_token = True
+        if no_token:
+            click.echo('Please run `hessh setup`.')
+            sys.exit(-1)
+        else:
+            return f(*args, **kwargs)
+    return wrapper
+
+
+@hessh.command()
+@click.option('--email', prompt='Hackerearth email', callback=validate_email,
+              help='Your hackerearth email address')
+@click.option('--password', confirmation_prompt=True,
+              hide_input=True, prompt=True,
+              help=('This password will help you setup hessh on multiple'
+                    'systems. Make sure you remember it.'))
+def setup(email, password):
+    """
+    Run `hessh setup` once on all your systems, so that we can identify you and
+    give you access seemlessly whichever local machine you use.
+    """
+    data = {
+        'email': email,
+        'password': password,
+        'version': __version__,
+    }
+    # Create `config_dir` if not exists.
+    if not os.path.exists(CONFIG_DIR):
+        os.mkdir(CONFIG_DIR, 0700)
+    if not os.path.exists(CONFIG_FILE):
+        open(CONFIG_FILE, 'w').close()
+    if os.path.exists(PUBLIC_KEYFILE):
+        os.system('sudo rm -f {0}'.format(PUBLIC_KEYFILE))
+    if os.path.exists(PRIVATE_KEYFILE):
+        os.system('sudo rm -f {0}'.format(PRIVATE_KEYFILE))
+
+    # Generate user ssh key pair
+    os.system('ssh-keygen -b 2048 -t rsa -f {0} -q -N "" -C "{1}"'.format(
+        PRIVATE_KEYFILE, email))
+    with open(PUBLIC_KEYFILE) as fp:
+        user_public_key = fp.read()
+    os.chmod(PUBLIC_KEYFILE, 600)
+    data['public_key'] = user_public_key
+    response = req.post(API_URL + 'auth/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        token = response_data['token']
+        data['token'] = token
+        with open(CONFIG_FILE, 'w') as fp:
+            fp.write(json.dumps({
+                'email': email,
+                'token': token
+            }))
+        # This will setup VPN access
+        VPNSetup.setup(data)
+        click.secho('Setup complete.')
+        click.secho('Now you can request access to machines using: hessh access staging')
+    else:
+        click.secho(response_data['message'])
+
+
+class VPNSetup(object):
+
+    @staticmethod
+    def run_shell_cmd(cmd, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
+        p = subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr,
+                             shell=True, close_fds=True)
+        stdout, stderr = p.communicate()
+        retcode = p.returncode
+        return retcode, stdout, stderr
+
+    @staticmethod
+    def _execute(cmd):
+        return_code, _, _ = VPNSetup.run_shell_cmd(cmd)
+        if return_code != 0:
+            click.secho('There was some error on executing: `{cmd}`'.format(cmd=cmd), fg='red')
+
+    @staticmethod
+    def _prepare_setup():
+        commands = [
+            'sudo apt-get update',
+            'sudo apt-get install -y resolvconf',
+            'sudo apt-get install -y openvpn',
+            'sudo apt-get install -y libssl-dev',
+            'sudo apt-get install -y liblzo2-dev',
+            'sudo apt-get install -y libpam0g-dev',
+            'sudo apt-get install -y easy-rsa',
+        ]
+        for cmd in commands:
+            click.secho(cmd)
+            VPNSetup._execute(cmd)
+
+    @staticmethod
+    def _setup_vpn(data):
+        response = req.post(API_URL+'vpn/key/', data=json.dumps(data))
+        response_data = response.json()
+        click.secho(response_data['message'])
+        file_to_create = 'hackerearth.conf'
+        path = os.path.join(CONFIG_DIR, file_to_create)
+        with open(path, 'w') as fp:
+            fp.write(response_data['key'])
+        cmd = 'sudo cp {path} {to}'.format(path=path, to='/etc/openvpn/')
+        VPNSetup._execute(cmd)
+
+        #temp_file = tempfile.mkstemp()
+        #with open(temp_file[1], 'w') as fp:
+        #    fp.write(content)
+        #cmd = 'sudo cp {path} {to}'.format(path=temp_file[1], to='/etc/network/if-up.d/openvpn')
+        #VPNSetup._execute(cmd)
+
+    @staticmethod
+    def _activate_vpn(data):
+        response = req.post(API_URL+'vpn/activate/', data=json.dumps(data))
+        response_data = response.json()
+        click.secho(response_data['message'])
+
+    @staticmethod
+    def _setup_ns():
+        content = 'nameserver 10.1.0.2\n'
+        temp_file = tempfile.mkstemp()
+        with open(temp_file[1], 'w') as fp:
+            fp.write(content)
+        head_path = '/etc/resolvconf/resolv.conf.d/head'
+        cmd = 'sudo cp {path} {to}'.format(path=temp_file[1], to=head_path)
+        VPNSetup._execute(cmd)
+        content = 'options rotate\noptions timeout:1\n'
+        temp_file = tempfile.mkstemp()
+        with open(temp_file[1], 'w') as fp:
+            fp.write(content)
+        cmd = 'sudo cp {path} {to}'.format(path=temp_file[1], to='/etc/resolvconf/resolv.conf.d/tail')
+        VPNSetup._execute(cmd)
+        cmd = 'sudo resolvconf -u'
+        VPNSetup._execute(cmd)
+
+    @staticmethod
+    def _finalize_setup():
+        commands = [
+            'sudo apt-get purge openvpn',
+            'sudo apt-get install openvpn',
+            'sudo service openvpn restart',
+        ]
+        for cmd in commands:
+            VPNSetup._execute(cmd)
+
+    @classmethod
+    def setup(cls, data):
+        click.secho('Initializing VPN setup, please be patient...')
+        cls._prepare_setup()
+        cls._setup_vpn(data)
+        click.secho('Trying to activate VPN...')
+        cls._activate_vpn(data)
+        click.secho('Setting up nameserver in resolv.conf...')
+        cls._setup_ns()
+        click.secho('Starting VPN...')
+        cls._finalize_setup()
+        click.secho('VPN setup complete. Use `hessh connect` and `hessh disconnect`.')
+
+@hessh.command()
+@check_config_existance
+def setup_vpn():
+    """
+    Run `hessh setup_vpn` once if you are an old user. This will setup VPN
+    account for you and try to activate it.`
+    """
+    VPNSetup.setup(data)
+
+
+@hessh.command()
+@check_config_existance
+def connect():
+    """
+    Starts openvpn service
+    """
+    VPNSetup._execute('sudo service openvpn start')
+    click.secho('Hackerearth VPN is ON.', fg='green')
+
+
+@hessh.command()
+@check_config_existance
+def disconnect():
+    """
+    Stops openvpn service
+    """
+    VPNSetup._execute('sudo service openvpn stop')
+    click.secho('Hackerearth VPN is OFF.', fg='red')
+
+
+@hessh.command()
+@click.argument('emails', nargs=-1)
+@check_config_existance
+def verify(emails):
+    """
+    Run `hessh verify <email0> <email1>` to verify new users. Then only new
+    users can use hessh service. This is a superuser only command.
+    """
+    email_pattern = re.compile(r'\w+@hackerearth.com$')
+    emails = [_.strip(',') for _ in emails if email_pattern.search(_.strip(',')) is not None]
+    if not emails:
+        click.secho('Please enter at least one correct email.')
+        sys.exit(0)
+    click.secho('Verifying these users: %s' % ' '.join(emails))
+    data['users_to_activate'] = emails
+    response = req.post(API_URL + 'verify/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    click.secho(response_data['message'])
+
+
+@hessh.command()
+@click.argument('emails', nargs=-1)
+@check_config_existance
+def unverify(emails):
+    """
+    Run `hessh unverify <email0> <email1>` to unverify users. This is a superuser only command.
+    """
+    email_pattern = re.compile(r'\w+@hackerearth.com$')
+    emails = [_.strip(',') for _ in emails if email_pattern.search(_.strip(',')) is not None]
+    if not emails:
+        click.secho('Please enter at least one correct email.')
+        sys.exit(0)
+    click.secho('Unverifying these users: %s' % ' '.join(emails))
+    data['users_to_deactivate'] = emails
+    response = req.post(API_URL + 'unverify/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    click.secho(response_data['message'])
+
+
+@hessh.command()
+@click.argument('machine')
+@click.option('--user', default='careerstack',
+              help='username of the target machine you want access to')
+@check_config_existance
+def access(machine, user):
+    """
+    Run `hessh access <search-term>` to list down all matching machines.
+    If there is only single entry then it will auto request for you else
+    you have to select a machine and if you already have access to that machine
+    it will allow you login. For superusers it will automatically
+    grant access and login.
+    """
+    data[u'keyword'] = machine
+    data[u'target_user'] = user
+    response = req.post(API_URL + 'machines/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        machines = response_data['machines']
+        user_using_machines = response_data['user_using_machines']
+        machines_count = len(machines)
+        if machines_count == 0:
+            click.secho('No machines found matching: %s. This means either no '
+                        'machine exists or someone is using it.' % machine)
+            sys.exit(0)
+        elif machines_count == 1:
+            selected_machine = 0
+        else:
+            for num, machine in enumerate(machines):
+                color_kwargs = {}
+                if machine['name'] in user_using_machines:
+                    color_kwargs['fg'] = 'green'
+                click.secho('{0}. {1}'.format(num, machine['name']),
+                        **color_kwargs)
+            click.secho('* Green colored machines means you already have access'
+                        ' to them.', fg='yellow')
+            while True:
+                selected_machine = click.prompt(
+                    'Please select the machine you want access to',
+                    type=int)
+                if 0 <= selected_machine < machines_count:
+                    break
+                else:
+                    click.secho('Wrong input. Please select the correct '
+                                'integer which is present left of any entry.',
+                                fg='red')
+        data.update(machines[selected_machine])
+        data.pop(u'keyword')
+        response = req.post(API_URL + 'request-access/', data=json.dumps(data))
+        response_data = json.loads(response.content)
+        click.secho(response_data['message'])
+        if 'machine' in response_data:
+            users = ['careerstack', 'ubuntu', 'ec2-user']
+            cmds = []
+            if 'use_jumphost' in response_data and response_data['use_jumphost']:
+                for user in users:
+                    cmd = (
+                        'ssh -i {0} -o "ProxyCommand ssh -W %h:%p -i '
+                        '{0} {1} ' '-o StrictHostKeyChecking=no" '
+                        '{2}@{3} -o StrictHostKeyChecking=no'.format(
+                        PRIVATE_KEYFILE, response_data['jumphost'],
+                        user, response_data['machine'])
+                    )
+                    cmds.append(cmd)
+            else:
+                for user in users:
+                    cmd = (
+                        'ssh -i {0} '
+                        '{1}@{2} -o StrictHostKeyChecking=no'.format(
+                        PRIVATE_KEYFILE,
+                        user, response_data['machine'])
+                    )
+                    cmds.append(cmd)
+            for cmd in cmds:
+                retcode = os.system(cmd)
+                if retcode == 33280:
+                    break
+
+        elif 'access_token' in response_data:
+            click.secho('However if you need access immediately pass this to '
+                        'any of the administrators: `hessh grant {0}`'.format(
+                        response_data['access_token']))
+    else:
+        click.secho(response_data['message'])
+
+
+@hessh.command()
+@click.option('--copy_from', prompt='Absolute file path to copy from',
+              type=str)
+@click.option('--copy_to', default=os.getcwd())
+@click.option('--user', default='careerstack')
+@check_config_existance
+def scp(copy_from, copy_to, user):
+    click.secho('Please use normal scp command. THis has been deprecated since we moved to VPC.', fg='red')
+    sys.exit(0)
+    response = req.post(API_URL + 'blocked-machines/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        machines = response_data['machines']
+        machines_count = len(machines)
+        if machines_count == 0:
+            click.secho('No machines had been alloacted to you. Type `hessh access'
+                        ' staging` to request access.')
+            sys.exit(0)
+        elif machines_count == 1:
+            selected_machine = 0
+        else:
+            for num, machine in enumerate(machines):
+                click.secho('{0}. {1}'.format(num, machine['name']))
+            while True:
+                selected_machine = click.prompt(
+                    'Please select the machine you want to copy data from',
+                    type=int)
+                if 0 <= selected_machine < machines_count:
+                    break
+                else:
+                    click.secho('Wrong input. Please select the correct '
+                                'integer which is present left of any entry.')
+        data.update(machines[selected_machine])
+        data.update({
+            'copy_from': copy_from,
+            'copy_to': copy_to,
+            'target_user': user,
+        })
+        response = req.post(API_URL + 'scp/', data=json.dumps(data))
+        response_data = json.loads(response.content)
+        if 'copied_file' in response_data:
+            scp_command = ('scp -i {0} -o UserKnownHostsFile=/dev/null '
+                          '-o StrictHostKeyChecking=no {1}:{2} {3}'.format(
+                PRIVATE_KEYFILE, response_data['jumphost'],
+                response_data['copied_file'], copy_to))
+            os.system(scp_command)
+            os.system('mv {0} {1}'.format(os.path.join(copy_to,
+                      response_data['copied_file'].split('/')[-1]),
+                      os.path.join(copy_to, copy_from.split('/')[-1])))
+        else:
+            click.secho(response_data['message'])
+    else:
+        click.secho(response_data['message'])
+
+
+@hessh.command()
+@click.option('--lfp', prompt='Absolute file path of local file',
+              type=str, help='absolute path of the local file which you want to upload')
+@click.option('--rfp', default="~/",
+              help='absolute path on remote machie where you want to upload')
+@click.option('--user', default='careerstack',
+              help='username of the target machine you want access to')
+@check_config_existance
+def upload(lfp, rfp, user):
+    """
+    upload a file from local to remote
+    :param lfp: str, full path from where to copy
+    :param rfp: str, full path in the remote machine where you waana copy
+    :param user: str, which user to use
+    :return: None
+    """
+    if rfp == '~/':
+        click.secho('use --rfp while running the command to specify file path on remote. ' +
+                'Otherwise it will be stored in home directory with same name as local', fg='yellow')
+    do_scp(lfp, rfp, user, action='upload')
+
+
+@hessh.command()
+@click.option('--lfp', default=".",
+              help='absolute local path where you want to store file')
+@click.option('--rfp', prompt='absolute path for remote file',
+              type=str, help='absolute path of the remote file')
+@click.option('--user', default='careerstack',
+              help='username of the target machine you want access to')
+@check_config_existance
+def download(lfp, rfp, user):
+    """
+    download a file from local to remote
+    :param lfp: str, full path where the file will be stored
+    :param rfp: str, full path of the file in remote machine
+    :param user: str, which user to use
+    :return: None
+    """
+    if lfp == '.':
+        click.secho('use --lfp while running the command to specify local file name. ' +
+                'Otherwise it will be stored in current directory with same name as remote', fg='yellow')
+    do_scp(lfp=lfp, rfp=rfp, user=user, action='download')
+
+
+def do_scp(lfp, rfp, user, action='upload'):
+    """
+    this will perform an upload of local file(lfp) to 
+    remote file (rfp). Only the absolute path is required.
+    user will be prompted for which remote
+    
+    :param lfp: str, local fil path
+    :param rfp: str, remote file path (better to user with ~)
+    :param user: str, which user to login into machine
+    :param action: str, download or upload
+    :return: 
+    """
+    response = req.post(API_URL + 'blocked-machines/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        machines = response_data['machines']
+        use_jumphost = response_data.get('use_jumphost')
+        jumphost = response_data.get('jumphost')
+        machines_count = len(machines)
+
+        if use_jumphost is True and not jumphost:
+            click.secho('Internal configuration error. contact infra team')
+            sys.exit(0)
+
+        if machines_count == 0:
+            click.secho('No machines had been alloacted to you. Type `hessh access'
+                        ' staging` to request access.')
+            sys.exit(0)
+        elif machines_count == 1:
+            selected_machine = 0
+        else:
+            for num, machine in enumerate(machines):
+                click.secho('{0}. {1}'.format(num, machine['name']))
+            while True:
+                selected_machine = click.prompt(
+                    'Please select the machine you want to copy data from',
+                    type=int)
+                if 0 <= selected_machine < machines_count:
+                    break
+                else:
+                    click.secho('Wrong input. Please select the correct '
+                                'integer which is present left of any entry.')
+        machine = machines[selected_machine]
+        click.secho("Using machine: {0}".format(machine['name']), fg='green')
+        remote_ip = machine[machine['key_name']]
+        scp_command_base = BaseConstants.get_scp_format(use_jumphost=use_jumphost, action=action)
+        scp_command = scp_command_base.format(
+            lfp=lfp, rfp=rfp, user=user, remote_machine=remote_ip,
+            jumphost=jumphost, user_key=PRIVATE_KEYFILE)
+        os.system(scp_command)
+    else:
+        click.secho(response_data['message'])
+
+
+@hessh.command()
+@click.option('--user', default='careerstack',
+              help='username of the target machine you want access to')
+@click.option('--al', is_flag=True, help='release all machines')
+@check_config_existance
+def free(user, al):
+    """
+    If you are no longer using a machine then help your fellow developers by
+    typing `hessh free`. It will remove your access from those machines.
+    """
+    response = req.post(API_URL + 'blocked-machines/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        machines = response_data['machines']
+        machines_count = len(machines)
+        if machines_count == 0:
+            click.secho('No machines had been alloacted to you. Type `hessh access'
+                        ' staging` to request access.')
+            sys.exit(0)
+        elif machines_count == 1:
+            selected_machine = 0
+        else:
+            for num, machine in enumerate(machines):
+                click.secho('{0}. {1}'.format(num, machine['name']))
+            while True and not al:
+                selected_machine = click.prompt(
+                    'Please select the machine you want to free',
+                    type=int)
+                if 0 <= selected_machine < machines_count:
+                    break
+                else:
+                    click.secho('Wrong input. Please select the correct '
+                                'integer which is present left of any entry.')
+
+        def release_machine(data):
+            data.update({'target_user': user})
+            response = req.post(API_URL + 'free/', data=json.dumps(data))
+            response_data = json.loads(response.content)
+            if 'machine' in response_data:
+                click.secho('You have released %s.' %response_data['machine'])
+            else:
+                click.secho(response_data['message'])
+        if not al:
+            data.update(machines[selected_machine])
+            release_machine(data)
+        else:
+            for num in xrange(len(machines)):
+                data.update(machines[num])
+                release_machine(data)
+    else:
+        click.secho(response_data['message'])
+
+
+@hessh.command()
+@click.argument('token', nargs=1)
+@click.option('--user', default='careerstack',
+              help='username of the target machine you want access to')
+@check_config_existance
+def grant(token, user):
+    """
+    Grant developers permission to access a particular machine. Whenever
+    someone requests for machine access token will come up on hipchat, however
+    you can do `hessh requests` to get the recent access requests.
+    This is a superuser only command.
+    """
+    data['access_token'] = token
+    data['target_user'] = user
+    response = req.post(API_URL + 'grant-access/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    click.secho(response_data['message'])
+
+
+@hessh.command()
+@click.argument('token', nargs=1)
+@click.option('--user', default='careerstack',
+              help='username of the target machine you want access to')
+@check_config_existance
+def revoke(token, user):
+    """
+    Revoke someone's access from a machine. To know the access token use `hessh
+    status`. This is a superuser only command.
+    """
+    data['access_token'] = token
+    data['target_user'] = user
+    response = req.post(API_URL + 'revoke-access/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    click.secho(response_data['message'])
+
+
+@hessh.command()
+@check_config_existance
+def status():
+    """
+    This will give you details of which machine is occupied by whom for how long.
+    """
+    response = req.post(API_URL + 'status/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        if response_data['blocked_access_data']:
+            table_data = [response_data['access_data_headers']]
+            table_data.extend(response_data['blocked_access_data'])
+            table = AsciiTable(table_data)
+            click.secho(table.table)
+        else:
+            click.secho('All machines are free to access.')
+    else:
+        click.secho(response_data['message'])
+
+
+@hessh.command()
+@check_config_existance
+def requests():
+    """
+    This will let you know who requested access for which machine.
+    """
+    response = req.post(API_URL + 'access-requests/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        if response_data['request_access_data']:
+            click.secho('\n'.join(response_data['request_access_data']))
+        else:
+            click.secho('No access request for now.')
+    else:
+        click.secho(response_data['message'])
+
+
+@hessh.command()
+@check_config_existance
+def verify_requests():
+    """
+    Lists all the new developers verify requests. To verify them use `hessh
+    verify`.
+    """
+    response = req.post(API_URL + 'verify-requests/', data=json.dumps(data))
+    response_data = json.loads(response.content)
+    if response.status_code == 200:
+        unverified_users = response_data['unverified_users']
+        if unverified_users:
+            click.secho('Unverified user emails are: {0}'.format(
+                        ', '.join(unverified_users)))
+        else:
+            click.secho('No unverified users.')
+    else:
+        click.secho(response_data['message'])
+
+
+if __name__ == '__main__':
+    hessh()
